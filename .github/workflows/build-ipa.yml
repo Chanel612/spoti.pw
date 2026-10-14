@@ -1,17 +1,21 @@
+
 name: Build IPA from your own Spotify IPA
 
 on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct link to a decrypted Spotify IPA"
+        description: "Direct IPA URL or Google Drive sharing link"
         required: true
         type: string
       upload_method:
         description: "Where to put the result"
         default: artifacts
         type: choice
-        options: [artifacts, filebin, both]
+        options:
+          - artifacts
+          - filebin
+          - both
 
 env:
   THEOS: ${{ github.workspace }}/theos
@@ -19,16 +23,20 @@ env:
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
       - uses: levibostian/action-hide-sensitive-inputs@v1
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      - uses: actions/checkout@v5
+      - name: Install Theos
+        uses: actions/checkout@v5
         with:
           repository: theos/theos
           path: theos
@@ -37,30 +45,107 @@ jobs:
       - name: Install tools
         run: |
           brew install make dpkg ldid
-          python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+
+          python3 -m pip install --break-system-packages \
+            git+https://github.com/asdfzxcvbn/pyzule-rw.git \
+            gdown
 
       - name: Download IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
         run: |
           mkdir -p ipa
-          curl -fsSL "${{ inputs.ipa_url }}" -o ipa/spotify.ipa
-          case "$(file --mime-type -b ipa/spotify.ipa)" in application/zip|application/x-ios-app) ;; *) echo "::error::Not an IPA"; exit 1 ;; esac
 
-      - run: make release
+          if [[ "$IPA_URL" == *"drive.google.com"* ]] || \
+             [[ "$IPA_URL" == *"drive.usercontent.google.com"* ]]; then
 
-      - uses: actions/upload-artifact@v5
+            echo "Downloading IPA from Google Drive..."
+
+            FILE_ID=$(python3 -c '
+          import os
+          import re
+          from urllib.parse import urlparse, parse_qs
+
+          url = os.environ["IPA_URL"]
+          parsed = urlparse(url)
+          match = re.search(r"/file/d/([^/]+)", parsed.path)
+          file_id = match.group(1) if match else parse_qs(parsed.query).get("id", [""])[0]
+          print(file_id)
+          ')
+
+            if [[ -z "$FILE_ID" ]]; then
+              echo "::error::Could not extract Google Drive file ID"
+              exit 1
+            fi
+
+            gdown "$FILE_ID" -O ipa/spotify.ipa
+
+          else
+            echo "Downloading IPA from direct URL..."
+            curl -fL --retry 3 \
+              "$IPA_URL" \
+              -o ipa/spotify.ipa
+          fi
+
+          echo "Validating downloaded IPA..."
+
+          python3 -c '
+          import zipfile
+          from pathlib import Path
+
+          path = Path("ipa/spotify.ipa")
+
+          if not path.exists():
+              raise SystemExit("ERROR: IPA not downloaded")
+
+          size = path.stat().st_size
+          print(f"File size: {size / 1048576:.2f} MB")
+
+          if size == 0:
+              raise SystemExit("ERROR: Empty download")
+
+          if not zipfile.is_zipfile(path):
+              raise SystemExit("ERROR: File is not a valid IPA ZIP archive")
+
+          with zipfile.ZipFile(path) as archive:
+              names = archive.namelist()
+              valid = any(
+                  n.startswith("Payload/")
+                  and ".app/Info.plist" in n
+                  for n in names
+              )
+              if not valid:
+                  raise SystemExit("ERROR: Missing iOS app structure")
+
+          print("IPA validation successful")
+          '
+
+      - name: Build modified IPA
+        run: make release
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v5
         if: inputs.upload_method != 'filebin'
         with:
           name: spoti.ipa
           path: out/*.ipa
           if-no-files-found: error
+          retention-days: 7
 
       - name: Upload to filebin.net
         if: inputs.upload_method != 'artifacts'
         run: |
           BIN="spotifyglass-${{ github.run_id }}"
-          echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "### IPA download" >> "$GITHUB_STEP_SUMMARY"
+
           for f in out/*.ipa; do
-            curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@$f" "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
-            echo "- https://filebin.net/$BIN/$(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
+            curl -fsS -X POST \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$f" \
+              "https://filebin.net/$BIN/$(basename "$f")" \
+              >/dev/null
+
+            echo "- https://filebin.net/$BIN/$(basename "$f")" \
+              >> "$GITHUB_STEP_SUMMARY"
           done
-          echo "- _filebin deletes bins after a few days of inactivity, download promptly._" >> "$GITHUB_STEP_SUMMARY"
