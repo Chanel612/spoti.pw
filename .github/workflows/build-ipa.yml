@@ -1,10 +1,11 @@
+
 name: Build IPA from your own Spotify IPA
 
 on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct link to a decrypted Spotify IPA"
+        description: "Google Drive link or direct decrypted IPA URL"
         required: true
         type: string
       upload_method:
@@ -37,15 +38,56 @@ jobs:
       - name: Install tools
         run: |
           brew install make dpkg ldid
-          python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+          python3 -m pip install --break-system-packages \
+            git+https://github.com/asdfzxcvbn/pyzule-rw.git \
+            gdown
 
       - name: Download IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
         run: |
           mkdir -p ipa
-          curl -fsSL "${{ inputs.ipa_url }}" -o ipa/spotify.ipa
-          case "$(file --mime-type -b ipa/spotify.ipa)" in application/zip|application/x-ios-app) ;; *) echo "::error::Not an IPA"; exit 1 ;; esac
 
-      - run: make release
+          if [[ "$IPA_URL" == *"drive.google.com"* ]] || \
+             [[ "$IPA_URL" == *"drive.usercontent.google.com"* ]]; then
+            echo "Downloading from Google Drive..."
+            gdown --fuzzy "$IPA_URL" -O ipa/spotify.ipa
+          else
+            echo "Downloading from direct URL..."
+            curl -fL --retry 3 "$IPA_URL" -o ipa/spotify.ipa
+          fi
+
+          echo "Checking downloaded IPA..."
+
+          python3 -c '
+          import zipfile
+          from pathlib import Path
+
+          path = Path("ipa/spotify.ipa")
+
+          if not path.exists() or path.stat().st_size == 0:
+              raise SystemExit("ERROR: Download is empty")
+
+          print(f"Downloaded: {path.stat().st_size / 1048576:.2f} MB")
+
+          if not zipfile.is_zipfile(path):
+              raise SystemExit("ERROR: Downloaded file is not an IPA archive")
+
+          with zipfile.ZipFile(path) as archive:
+              names = archive.namelist()
+              valid = any(
+                  name.startswith("Payload/")
+                  and ".app/Info.plist" in name
+                  for name in names
+              )
+              if not valid:
+                  raise SystemExit("ERROR: No iOS app found in IPA")
+
+          print("IPA validation successful")
+          '
+
+      - name: Build modified IPA
+        run: make release
 
       - uses: actions/upload-artifact@v5
         if: inputs.upload_method != 'filebin'
@@ -60,7 +102,9 @@ jobs:
           BIN="spotifyglass-${{ github.run_id }}"
           echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
           for f in out/*.ipa; do
-            curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@$f" "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
+            curl -fsS -X POST \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$f" \
+              "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
             echo "- https://filebin.net/$BIN/$(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
           done
-          echo "- _filebin deletes bins after a few days of inactivity, download promptly._" >> "$GITHUB_STEP_SUMMARY"
